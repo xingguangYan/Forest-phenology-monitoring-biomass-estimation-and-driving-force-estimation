@@ -1,1 +1,183 @@
 
+// ===================================================================
+// Forest Phenology Monitoring using MODIS MOD13Q1 (2002-2024)
+// Extracts: Start of Season (SOS), End of Season (EOS),
+//           Peak of Season (POS), and Length of Season (LOS)
+// ===================================================================
+
+// SECTION 1 - User parameters
+var vegIndex = 'NDVI';           // Vegetation index (only NDVI available in MOD13Q1)
+var th = 0.5;                    // Amplitude percentage for threshold
+var threshMin = 0.2;             // Minimum VI value (snow/cloud masking)
+var scale = 500;                 // Scale for reduction (meters)
+var lag = 16;                    // Temporal window for composites (days)
+var startYear = 2002;
+var endYear = 2024;
+
+// Import study area (replace with your own asset)
+var table = ee.FeatureCollection("projects/my-project-paper-462110/assets/wuhan_samples_2024");
+var roi = table;                 // Region of interest
+
+// SECTION 2 - Cubic interpolation function (daily resolution)
+function cubicInterpolation(collection, step) {
+  var listDekads = ee.List.sequence(1, collection.size().subtract(3), 1);
+  var colInterp = listDekads.map(function(ii) {
+    ii = ee.Number(ii);
+    var p0 = ee.Image(collection.toList(10000).get(ii.subtract(1)));
+    var p1 = ee.Image(collection.toList(10000).get(ii));
+    var p2 = ee.Image(collection.toList(10000).get(ii.add(1)));
+    var p3 = ee.Image(collection.toList(10000).get(ii.add(2)));
+
+    var diff01 = ee.Date(p1.get('system:time_start')).difference(ee.Date(p0.get('system:time_start')), 'day');
+    var diff12 = ee.Date(p2.get('system:time_start')).difference(ee.Date(p1.get('system:time_start')), 'day');
+    var diff23 = ee.Date(p3.get('system:time_start')).difference(ee.Date(p2.get('system:time_start')), 'day');
+
+    var diff01nor = diff01.divide(diff12);
+    var diff12nor = diff12.divide(diff12);
+    var diff23nor = diff23.divide(diff12);
+
+    var f0 = p1;
+    var f1 = p2;
+    var f0p = (p2.subtract(p0)).divide(diff01nor.add(diff12nor));
+    var f1p = (p3.subtract(p1)).divide(diff12nor.add(diff23nor));
+
+    var a = (f0.multiply(2)).subtract(f1.multiply(2)).add(f0p).add(f1p);
+    var b = (f0.multiply(-3)).add(f1.multiply(3)).subtract(f0p.multiply(2)).subtract(f1p);
+    var c = f0p;
+    var d = f0;
+
+    var xValues = ee.List.sequence(0, diff12.subtract(1), step);
+    var xDates = ee.List.sequence(p1.get('system:time_start'), p2.get('system:time_start'), 86400000);
+
+    var interp = xValues.map(function(x) {
+      var im = ee.Image(ee.Number(x).divide(diff12));
+      return (im.pow(3)).multiply(a)
+              .add((im.pow(2)).multiply(b))
+              .add(im.multiply(c))
+              .add(d)
+              .set('system:time_start', ee.Number(xDates.get(x)));
+    });
+    return interp;
+  });
+  return ee.ImageCollection(colInterp.flatten());
+}
+
+// SECTION 3 - Main loop over years
+var resultsFC = ee.FeatureCollection([]);   // Store yearly results
+
+for (var year = startYear; year <= endYear; year++) {
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+
+  // Load MOD13Q1 NDVI, scale to [0,1], clamp low values
+  var modis = ee.ImageCollection("MODIS/061/MOD13Q1")
+                .filterDate(startDate, endDate)
+                .filterBounds(roi)
+                .map(function(im) {
+                  var ndvi = im.select('NDVI').divide(10000).rename('bio');
+                  return ndvi.where(ndvi.lt(threshMin), threshMin);
+                });
+
+  // ---- Step 1: Create moving window composites (every 'lag' days) ----
+  var listDates = ee.List.sequence(startDate.millis(), endDate.millis(), 86400000 * lag);
+  var colDekadsRaw = ee.ImageCollection(listDates.map(function(dd) {
+    var date_window = ee.Date(ee.Number(dd));
+    var date_startW = date_window.advance(-lag/2, 'days');
+    var date_endW = date_window.advance(lag/2, 'days');
+    var col_window = modis.filterDate(date_startW, date_endW);
+    var meanImg = col_window.reduce(ee.Reducer.mean());
+    return meanImg.set('system:time_start', date_window.millis())
+                  .set('empty', col_window.size().eq(0));
+  }).flatten());
+
+  // Fill empty composites with threshMin
+  var colDekadsEmpty = colDekadsRaw.filterMetadata('empty', 'equals', 1)
+    .map(function(im) {
+      return ee.Image(threshMin).rename('bio')
+             .copyProperties(im, ['system:time_start']);
+    });
+  var colDekads = colDekadsRaw.filterMetadata('empty', 'equals', 0)
+                    .merge(colDekadsEmpty);
+
+  // ---- Step 2: Gap鈥慺ill empty composites using neighbouring windows ----
+  colDekads = colDekads.map(function(im) {
+    var date_window = ee.Date(im.get('system:time_start'));
+    var date_startW = date_window.advance(-lag*2, 'days');
+    var date_endW = date_window.advance(lag*2, 'days');
+    var meanIm1 = colDekads.filterDate(date_startW, date_window.advance(1, 'days'))
+                           .reduce(ee.Reducer.mean());
+    var meanIm2 = colDekads.filterDate(date_window.advance(-1, 'days'), date_endW)
+                           .reduce(ee.Reducer.mean());
+    var meanIm = (meanIm1.add(meanIm2)).divide(2);
+    return im.unmask(meanIm).copyProperties(im, ['system:time_start']);
+  }).sort('system:time_start');
+
+  // ---- Step 3: Cubic interpolation to daily time series ----
+  var interp = cubicInterpolation(colDekads, 1);
+
+  // Add a timestamp band for reduction (needed for SOS/EOS extraction)
+  interp = interp.map(function(im) {
+    return im.rename('bio')
+             .addBands(im.metadata('system:time_start', 'date1'))
+             .copyProperties(im, ['system:time_start']);
+  });
+
+  // ---- Step 4: Compute amplitude and threshold ----
+  var minND = ee.Image(threshMin);
+  var maxND = modis.max();                     // maximum observed VI in the year
+  var amplitude = maxND.subtract(minND);
+  var thresh = amplitude.multiply(th).add(minND).rename('bio');
+
+  // Mask values below the threshold
+  var col_aboveThresh = interp.map(function(im) {
+    var mask = im.select('bio').gt(thresh);
+    return im.updateMask(mask).copyProperties(im, ['system:time_start']);
+  });
+
+  // ---- Step 5: Extract phenological metrics ----
+  var init = ee.Image(ee.Date((year-1) + '-12-31').millis());  // DOY 0 reference
+
+  var SoS = col_aboveThresh.reduce(ee.Reducer.firstNonNull())
+                .select('date1_first').rename('SoS');
+  var SoS_doy = SoS.subtract(init).divide(86400000);
+
+  var EoS = col_aboveThresh.reduce(ee.Reducer.lastNonNull())
+                .select('date1_last').rename('EoS');
+  var EoS_doy = EoS.subtract(init).divide(86400000);
+
+  var POS = col_aboveThresh.reduce(ee.Reducer.max())
+                .select('date1_max').rename('POS');
+  var POS_doy = POS.subtract(init).divide(86400000);
+
+  var LOS = EoS_doy.subtract(SoS_doy).rename('LOS');
+
+  // Reduce over the ROI (single value per year)
+  var threshVal = thresh.reduceRegion(ee.Reducer.first(), roi, scale).get('bio');
+  var sosDate = ee.Date(SoS.reduceRegion(ee.Reducer.first(), roi, scale).get('SoS'));
+  var eosDate = ee.Date(EoS.reduceRegion(ee.Reducer.first(), roi, scale).get('EoS'));
+  var posDate = ee.Date(POS.reduceRegion(ee.Reducer.first(), roi, scale).get('POS'));
+  var losVal = LOS.reduceRegion(ee.Reducer.first(), roi, scale).get('LOS');
+
+  // Store results as a Feature
+  var result = ee.Feature(null, {
+    'Year': year,
+    'Threshold': threshVal,
+    'SoS_Date': sosDate,
+    'EoS_Date': eosDate,
+    'POS_Date': posDate,
+    'SoS_DOY': SoS_doy.reduceRegion(ee.Reducer.first(), roi, scale).get('SoS_doy'),
+    'EoS_DOY': EoS_doy.reduceRegion(ee.Reducer.first(), roi, scale).get('EoS_doy'),
+    'POS_DOY': POS_doy.reduceRegion(ee.Reducer.first(), roi, scale).get('POS_doy'),
+    'LOS': losVal
+  });
+
+  resultsFC = resultsFC.merge(result);
+}
+
+// Export results to Google Drive
+Export.table.toDrive({
+  collection: resultsFC,
+  description: 'MODIS_Phenology_2002_2024',
+  folder: 'phenology_results',
+  fileFormat: 'CSV'
+});
