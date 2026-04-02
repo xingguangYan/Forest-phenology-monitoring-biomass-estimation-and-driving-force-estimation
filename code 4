@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+
+# ==================== 1. Data loading ====================
+# Read Excel file containing yearly phenology means
+file_path = 'phenology_yearly_means_filtered.xlsx'
+df = pd.read_excel(file_path, sheet_name='Summary_All', header=None, skiprows=1)
+df.columns = ['DataSource', 'Year', 'SOS', 'POS', 'EOS', 'LOS']
+
+# Keep only the three selected sensors
+filtered_sources = ['Landsat5', 'Landsat8', 'MOD09A1']
+df_filtered = df[df['DataSource'].isin(filtered_sources)].copy()
+
+# ==================== 2. Linear regression analysis ====================
+indicators = ['SOS', 'POS', 'EOS', 'LOS']
+results = []
+
+# Loop over each phenological indicator and each data source
+for indicator in indicators:
+    for source in filtered_sources:
+        source_data = df_filtered[df_filtered['DataSource'] == source].sort_values('Year')
+        
+        # Need at least 3 points for a meaningful regression
+        if len(source_data) < 3:
+            continue
+        
+        # Perform linear regression: Year vs. indicator value
+        slope, intercept, r_value, p_value, std_err = stats.linregress(
+            source_data['Year'], source_data[indicator])
+        
+        # Assign significance stars
+        if p_value < 0.001:
+            significance = '***'
+        elif p_value < 0.01:
+            significance = '**'
+        elif p_value < 0.05:
+            significance = '*'
+        else:
+            significance = 'ns'
+        
+        # Format regression equation for display
+        intercept_fmt = int(round(intercept))
+        slope_fmt = f"{slope:+.2f}"
+        
+        results.append({
+            'Indicator': indicator,
+            'DataSource': source,
+            'Slope': slope,
+            'Intercept': intercept,
+            'R2': r_value**2,
+            'P_value': p_value,
+            'Significance': significance,
+            'Equation': f"y={slope_fmt}x{intercept_fmt:+.0f}, R²={r_value**2:.2f} {significance}",
+            'N': len(source_data)
+        })
+
+# ==================== 3. Output results ====================
+results_df = pd.DataFrame(results)
+print("="*80)
+print("Linear Regression Results")
+print("="*80)
+for indicator in indicators:
+    print(f"\n【{indicator}】")
+    indicator_data = results_df[results_df['Indicator'] == indicator]
+    for _, row in indicator_data.iterrows():
+        print(f"{row['DataSource']:12s}: {row['Equation']}")
+
+# Export to CSV
+results_df.to_csv('regression_results.csv', index=False)
+print("\nResults saved to regression_results.csv")
+
+# ==================== 4. Visualization (optional) ====================
+fig, axes = plt.subplots(2, 2, figsize=(14, 11), dpi=300)
+axes = axes.flatten()
+
+# Define consistent colors and markers for each sensor
+colors = {'Landsat5': '#1f77b4', 'Landsat8': '#ff7f0e', 'MOD09A1': '#2ca02c'}
+markers = {'Landsat5': 's', 'Landsat8': '^', 'MOD09A1': 'o'}
+titles = ['(a) SOS (Start of Season)', '(b) POS (Peak of Season)', 
+          '(c) EOS (End of Season)', '(d) LOS (Length of Season)']
+
+for idx, indicator in enumerate(indicators):
+    ax = axes[idx]
+    
+    for source in filtered_sources:
+        source_data = df_filtered[df_filtered['DataSource'] == source].sort_values('Year')
+        if len(source_data) == 0:
+            continue
+            
+        # Re‑compute regression for plotting (can reuse from earlier, but simpler to recompute)
+        slope, intercept, r_value, p_value, _ = stats.linregress(
+            source_data['Year'], source_data[indicator])
+        
+        # Scatter points
+        ax.scatter(source_data['Year'], source_data[indicator], 
+                  c=colors[source], s=35, marker=markers[source], 
+                  edgecolors='white', linewidth=0.8)
+        
+        # Trend line
+        x_trend = np.linspace(source_data['Year'].min(), source_data['Year'].max(), 100)
+        y_trend = slope * x_trend + intercept
+        # Use dashed line if significant (p<0.05), dotted otherwise
+        line_style = '--' if p_value < 0.05 else ':'
+        ax.plot(x_trend, y_trend, line_style, color=colors[source], alpha=0.8)
+    
+    ax.set_title(titles[idx], fontsize=13, fontweight='bold')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Day of Year' if indicator != 'LOS' else 'Days')
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('phenology_trends.png', dpi=300, bbox_inches='tight')
+print("Figure saved to phenology_trends.png")
