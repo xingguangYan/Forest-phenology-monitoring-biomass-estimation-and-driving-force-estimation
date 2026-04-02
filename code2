@@ -1,0 +1,211 @@
+// =====================================================================
+// Forest Aboveground Biomass Estimation using Random Forest
+// Data sources: HLS (Sentinel-2), NASADEM, ALOS PALSAR, GEDI L4B
+// =====================================================================
+
+// SECTION 1 - User inputs and study area
+var roi = ee.FeatureCollection("projects/my-project-paper-462110/assets/forest_whu_shp");
+var start = '2019-04-01';
+var end   = '2019-11-01';
+var scale = 30;                    // Target resolution (meters)
+var crs   = 'EPSG:4326';           // Output projection
+
+// SECTION 2 - Helper functions
+function rename(img) {
+  // Rename HLS bands to generic names
+  return img.select(
+    ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+    ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2']
+  );
+}
+
+function calVI(img) {
+  // Compute a wide range of vegetation indices
+  var ndvi = img.normalizedDifference(['NIR', 'Red']).rename('NDVI');
+  var gndvi = img.normalizedDifference(['NIR', 'Green']).rename('GNDVI');
+  var nbr = img.normalizedDifference(['NIR', 'SWIR1']).rename('NBR');
+  var ndwi = img.normalizedDifference(['Green', 'NIR']).rename('NDWI');
+  var mndwi = img.normalizedDifference(['Green', 'SWIR1']).rename('MNDWI');
+  var ndmi = img.normalizedDifference(['NIR', 'SWIR1']).rename('NDMI');
+  var ndsi = img.normalizedDifference(['Green', 'NIR']).rename('NDSI');
+  var sipi = img.expression('(NIR - Blue) / (NIR - Red)', {
+    'NIR': img.select('NIR'), 'Blue': img.select('Blue'), 'Red': img.select('Red')
+  }).rename('SIPI');
+  var evi = img.expression('2.5 * ((NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1))', {
+    'NIR': img.select('NIR'), 'Red': img.select('Red'), 'Blue': img.select('Blue')
+  }).rename('EVI');
+  var evi2 = img.expression('2.5 * ((NIR - Red) / (NIR + 2.4*Red + 1))', {
+    'NIR': img.select('NIR'), 'Red': img.select('Red')
+  }).rename('EVI2');
+  var savi = img.expression('((NIR - Red) * 1.5) / (NIR + Red + 0.5)', {
+    'NIR': img.select('NIR'), 'Red': img.select('Red')
+  }).rename('SAVI');
+  var osavi = img.expression('(NIR - Red) / (NIR + Red + 0.16)', {
+    'NIR': img.select('NIR'), 'Red': img.select('Red')
+  }).rename('OSAVI');
+  // Add only the most relevant indices (you can extend if needed)
+  return img.addBands(ndvi).addBands(gndvi).addBands(nbr)
+            .addBands(ndwi).addBands(mndwi).addBands(ndmi)
+            .addBands(ndsi).addBands(sipi).addBands(evi)
+            .addBands(evi2).addBands(savi).addBands(osavi);
+}
+
+// SECTION 3 - Load and preprocess optical data (HLS)
+var hls = ee.ImageCollection("NASA/HLS/HLSS30/v002")
+  .filterBounds(roi)
+  .filterDate(start, end)
+  .filter(ee.Filter.lt('CLOUD_COVERAGE', 30))
+  .map(rename)
+  .map(calVI);
+
+// Median composite of spectral bands and indices
+var spectral = hls.select(['Blue','Green','Red','NIR','SWIR1','SWIR2']).median().clip(roi);
+var indices  = hls.select(['NDVI','GNDVI','NBR','NDWI','MNDWI','NDMI','NDSI','SIPI','EVI','EVI2','SAVI','OSAVI']).median().clip(roi);
+
+// SECTION 4 - Terrain (NASADEM)
+var dem = ee.Image('NASA/NASADEM_HGT/001').select('elevation').clip(roi);
+var terrain = ee.Algorithms.Terrain(dem).clip(roi);  // slope, aspect, hillshade
+
+// SECTION 5 - Tasseled Cap Transform (Sentinel-2 coefficients)
+var l8 = hls.select(['Blue','Green','Red','NIR','SWIR1','SWIR2']).median().clip(roi);
+var tcCoeffs = ee.Array([
+  [0.3037, 0.2793, 0.4743, 0.5585, 0.5082, 0.1863],  // brightness
+  [-0.2848, -0.2435, -0.5436, 0.7243, 0.0840, 0.1800], // greenness
+  [0.1509, 0.1973, 0.3279, 0.3406, -0.7112, -0.4572]    // wetness
+]);
+var arrayImg = l8.toArray().toArray(1);
+var tasseled = ee.Image(tcCoeffs).matrixMultiply(arrayImg)
+                .arrayProject([0]).arrayFlatten([['brightness','greenness','wetness']]);
+var tcd = tasseled.select('brightness').pow(2)
+          .add(tasseled.select('greenness').pow(2)).sqrt().rename('TCD');
+var tca = tasseled.select('greenness').divide(tasseled.select('brightness'))
+          .atan().rename('TCA');
+
+// SECTION 6 - SAR (ALOS PALSAR)
+var sar = ee.ImageCollection("JAXA/ALOS/PALSAR/YEARLY/SAR_EPOCH")
+  .filterDate(start, end)
+  .filterBounds(roi)
+  .select('HH','HV')
+  .mosaic()
+  .clip(roi);
+
+// SECTION 7 - GEDI biomass (L4B) and canopy height (L2A rh98)
+var gediBio = ee.Image("LARSE/GEDI/GEDI04_B_002").select('MU', 'agbd');
+var gediBioClipped = gediBio.clip(roi);
+
+// GEDI RH98 (canopy height)
+function gediQuality(im) {
+  return im.updateMask(im.select('quality_flag').eq(1))
+          .updateMask(im.select('degrade_flag').eq(0));
+}
+var gediRh = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+  .filterDate(start, end)
+  .map(gediQuality)
+  .select('rh98')
+  .filterBounds(roi)
+  .mosaic()
+  .clip(roi)
+  .rename('rh98');
+
+// SECTION 8 - Merge all predictors into one image
+var predictors = spectral
+  .addBands(indices)
+  .addBands(terrain)
+  .addBands(tasseled)
+  .addBands(tcd)
+  .addBands(tca)
+  .addBands(sar)
+  .addBands(gediBioClipped)
+  .addBands(gediRh);
+
+// Define the list of predictor band names
+var bandNames = [
+  'Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2',
+  'NDVI', 'GNDVI', 'NBR', 'NDWI', 'MNDWI', 'NDMI', 'NDSI', 'SIPI',
+  'EVI', 'EVI2', 'SAVI', 'OSAVI',
+  'elevation', 'slope', 'aspect', 'hillshade',
+  'brightness', 'greenness', 'wetness', 'TCD', 'TCA',
+  'HH', 'HV', 'agbd', 'rh98'
+];
+
+// SECTION 9 - Sample points for training/validation
+var samplePoints = predictors.sample({
+  region: roi,
+  scale: scale,
+  numPixels: 1000,
+  geometries: true
+}).randomColumn('random', 42);
+
+var trainingData = samplePoints.filter(ee.Filter.lt('random', 0.7));
+var validationData = samplePoints.filter(ee.Filter.gte('random', 0.7));
+
+// SECTION 10 - Train Random Forest regression
+var rf = ee.Classifier.smileRandomForest(100)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: trainingData,
+    classProperty: 'agbd',
+    inputProperties: bandNames
+  });
+
+// SECTION 11 - Apply model and map
+var predicted = predictors.select(bandNames).classify(rf).rename('predicted').clip(roi);
+
+// Visualization
+var viz = {min: 0, max: 150, palette: ['065143','AEC3B0','FE4A49']};
+Map.addLayer(predicted.clip(roi), viz, 'Predicted Biomass');
+Map.centerObject(roi, 10);
+
+// SECTION 12 - Validation metrics
+var predictedVals = predicted.sampleRegions({
+  collection: validationData,
+  properties: ['agbd'],
+  scale: scale
+});
+
+// Extract arrays
+var predArray = ee.Array(predictedVals.aggregate_array('predicted'));
+var obsArray  = ee.Array(predictedVals.aggregate_array('agbd'));
+
+// RMSE
+var rmse = obsArray.subtract(predArray).pow(2).reduce('mean', [0]).sqrt();
+print('RMSE (Mg/ha):', rmse);
+
+// R²
+var meanObs = obsArray.reduce('mean', [0]);
+var sst = obsArray.subtract(meanObs).pow(2).reduce('sum', [0]);
+var sse = obsArray.subtract(predArray).pow(2).reduce('sum', [0]);
+var r2 = ee.Number(1).subtract(sse.divide(sst));
+print('R²:', r2);
+
+// MAE
+var mae = obsArray.subtract(predArray).abs().reduce('mean', [0]);
+print('MAE (Mg/ha):', mae);
+
+// SECTION 13 - Variable importance
+var importance = ee.Dictionary(rf.explain().get('importance'));
+var importanceChart = ui.Chart.feature.byProperty(ee.Feature(null, importance))
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'Random Forest Variable Importance',
+    hAxis: {title: 'Band'},
+    vAxis: {title: 'Importance'},
+    legend: {position: 'none'}
+  });
+print(importanceChart);
+
+// SECTION 14 - Export results
+Export.image.toDrive({
+  image: predicted,
+  description: 'Biomass_map_HLS_RF',
+  scale: scale,
+  crs: crs,
+  region: roi,
+  maxPixels: 1e13
+});
+
+Export.table.toDrive({
+  collection: predictedVals,
+  description: 'Validation_points_biomass',
+  fileFormat: 'CSV'
+});
