@@ -1,0 +1,279 @@
+# =====================================================================
+# Geodetector analysis (GD package) – step‑by‑step debugging version
+# =====================================================================
+
+library(GD)
+library(ggplot2)
+
+# ---------------------------------------------------------------------
+# 1. Read data (robust reading)
+# ---------------------------------------------------------------------
+data <- read.csv(
+  # "D:/2025论文/计算地理探测器的表格/20171018_gd.csv",
+  "D:/2025论文/计算地理探测器的表格/地理探测器数据16个20251207/20240425_EM_gd.csv",
+  stringsAsFactors = FALSE,          # do not auto‑convert to factors
+  na.strings = c("", "NA", "N/A", "#N/A", "null", "NULL")  # missing value markers
+)
+
+# Step 1: Check response variable
+response_var <- data$predicted_norm
+summary(response_var)
+if (all(is.na(response_var))) {
+  stop("Response variable 'predicted_norm' is all NA!")
+}
+
+# Step 2: Check each explanatory variable
+vars_to_check <- c(
+  "ERA5_surface_pressure_norm", "ERA5_temperature_2m_norm",
+  "ERA5_total_evaporation_sum_norm", "ERA5_total_precipitation_sum_norm",
+  "GLDAS_SoilMoi0_10cm_inst_norm","aspect_norm", "avg_rad_norm", "elevation_norm", "hillshade_norm",
+  "slope_norm", "soc_mean_norm","HM2022s_HI_norm","HM2022s_TI_norm"
+)
+
+# Loop over variables to report missing values and range
+for (var in vars_to_check) {
+  if (!var %in% names(data)) {
+    cat("Variable", var, "does not exist in the dataset\n")
+  } else {
+    var_data <- data[[var]]
+    na_count <- sum(is.na(var_data))
+    cat(sprintf("%-35s: NA count = %d, valid count = %d, min = %.4f, max = %.4f\n",
+                var, na_count, sum(!is.na(var_data)),
+                min(var_data, na.rm = TRUE),
+                max(var_data, na.rm = TRUE)))
+  }
+}
+
+# Step 3: Create a clean dataset (remove rows with missing values)
+selected_vars <- c("predicted_norm", vars_to_check)
+data_selected <- data[, selected_vars]
+data_complete <- na.omit(data_selected)
+cat("Original rows:", nrow(data), "\n")
+cat("Rows after removing NAs:", nrow(data_complete), "\n")
+
+# If too few rows remain, issue a warning
+if (nrow(data_complete) < 100) {
+  warning("Very few rows after cleaning – consider imputation")
+}
+
+# ---------------------------------------------------------------------
+# 4. Run a simplified test with a subset of variables
+# ---------------------------------------------------------------------
+test_formula <- predicted_norm ~ ERA5_surface_pressure_norm + 
+                ERA5_temperature_2m_norm + ERA5_total_evaporation_sum_norm + 
+                ERA5_total_precipitation_sum_norm + GLDAS_SoilMoi0_10cm_inst_norm + 
+                aspect_norm + avg_rad_norm + elevation_norm + hillshade_norm + 
+                slope_norm + soc_mean_norm + HM2022s_HI_norm + HM2022s_TI_norm
+
+test_vars <- c("ERA5_surface_pressure_norm","ERA5_temperature_2m_norm",
+               "ERA5_total_evaporation_sum_norm","ERA5_total_precipitation_sum_norm",
+               "GLDAS_SoilMoi0_10cm_inst_norm","aspect_norm","avg_rad_norm",
+               "elevation_norm","hillshade_norm","slope_norm","soc_mean_norm",
+               "HM2022s_HI_norm","HM2022s_TI_norm")
+
+# Create vectors of length equal to number of continuous variables
+discmethod_full <- rep("equal", length(test_vars))   # e.g., all use equal interval
+discitv_full    <- rep(5, length(test_vars))         # e.g., all use 5 classes
+
+# Run geodetector
+test_gdm <- gdm(
+  formula = test_formula,
+  continuous_variable = test_vars,
+  data = data_complete,
+  discmethod = discmethod_full,
+  discitv = discitv_full
+)
+
+print(test_gdm)
+
+# ---------------------------------------------------------------------
+# 5. Plotting (if test succeeded)
+# ---------------------------------------------------------------------
+
+# 5.1 Base R plot from GD package
+cat("\n=== GD built‑in plot ===\n")
+tryCatch({
+  plot(test_gdm)
+}, error = function(e) {
+  cat("GD plot error:", e$message, "\n")
+})
+
+# 5.2 Custom barplot (sorted by q‑value)
+cat("\n=== Custom barplot (q‑values sorted) ===\n")
+if (!is.null(test_gdm$gdm) && nrow(test_gdm$gdm) > 0) {
+  results <- test_gdm$gdm
+  results_sorted <- results[order(-results$q), ]
+  
+  par(mar = c(8, 5, 4, 2))   # increase bottom margin for long variable names
+  
+  colors <- colorRampPalette(c("#66C2A5", "#FC8D62"))(nrow(results_sorted))
+  
+  barplot(results_sorted$q, 
+          names.arg = results_sorted$variable,
+          las = 2,                # vertical labels
+          col = colors,
+          ylab = "q‑value",
+          main = "Geodetector: factor explanatory power (sorted)",
+          ylim = c(0, max(results_sorted$q) * 1.15),
+          cex.names = 0.8)
+  
+  # Add q‑value labels above bars
+  text(x = 1:length(results_sorted$q) - 0.5, 
+       y = results_sorted$q + max(results_sorted$q) * 0.02,
+       labels = sprintf("%.3f", results_sorted$q),
+       cex = 0.7, col = "darkred")
+  
+  # Significance markers (p‑value)
+  significance_colors <- ifelse(results_sorted$p < 0.01, "red", 
+                                ifelse(results_sorted$p < 0.05, "orange", "gray"))
+  points(x = 1:length(results_sorted$q) - 0.5, 
+         y = rep(-0.02, nrow(results_sorted)), 
+         pch = 19, col = significance_colors, cex = 1.2)
+  
+  legend("topright", 
+         legend = c("p < 0.01", "p < 0.05", "p ≥ 0.05"),
+         pch = 19, 
+         col = c("red", "orange", "gray"),
+         bty = "n", cex = 0.8)
+  
+  abline(h = 0.2, col = "blue", lty = 2, lwd = 1)
+  text(x = 1, y = 0.22, "q = 0.2 reference", col = "blue", adj = 0, cex = 0.8)
+  
+  par(mar = c(5, 4, 4, 2))   # reset margins
+}
+
+# 5.3 ggplot2 versions (more polished)
+cat("\n=== ggplot2 plots ===\n")
+if (!is.null(test_gdm$gdm) && nrow(test_gdm$gdm) > 0) {
+  library(ggplot2)
+  
+  plot_data <- test_gdm$gdm
+  plot_data <- plot_data[order(-plot_data$q), ]
+  plot_data$variable <- factor(plot_data$variable, levels = plot_data$variable)
+  
+  # Add significance stars
+  plot_data$significance <- cut(plot_data$p, 
+                                breaks = c(0, 0.01, 0.05, 1),
+                                labels = c("**", "*", "NS"))
+  
+  # Barplot
+  p1 <- ggplot(plot_data, aes(x = variable, y = q, fill = q)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_text(aes(label = sprintf("%.3f%s", q, significance)), 
+              vjust = -0.5, size = 3) +
+    scale_fill_gradient(low = "#66C2A5", high = "#FC8D62", name = "q‑value") +
+    labs(title = "Geodetector: factor explanatory power",
+         x = "Explanatory variable", 
+         y = "q‑value") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+          panel.grid.major = element_line(color = "grey90"),
+          panel.grid.minor = element_blank()) +
+    ylim(0, max(plot_data$q) * 1.15)
+  
+  print(p1)
+  
+  # Save barplot
+  ggsave("D:/2025论文/计算地理探测器的表格/gd_q_values_plot.png", 
+         p1, width = 10, height = 6, dpi = 300)
+  cat("Barplot saved to: gd_q_values_plot.png\n")
+  
+  # Scatter plot: q vs -log10(p)
+  p2 <- ggplot(plot_data, aes(x = q, y = -log10(p), color = q, size = q)) +
+    geom_point(alpha = 0.7) +
+    geom_text(aes(label = variable), hjust = 0, vjust = 0, nudge_x = 0.002, size = 3) +
+    scale_color_gradient(low = "blue", high = "red", name = "q‑value") +
+    scale_size(range = c(3, 8), name = "q‑value") +
+    labs(title = "q‑value vs. significance (-log10(p))",
+         x = "q‑value", 
+         y = "-log10(p‑value)") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+  
+  print(p2)
+  
+  ggsave("D:/2025论文/计算地理探测器的表格/gd_q_p_scatter.png", 
+         p2, width = 8, height = 6, dpi = 300)
+  cat("Scatter plot saved to: gd_q_p_scatter.png\n")
+}
+
+# ---------------------------------------------------------------------
+# 6. Export detailed results
+# ---------------------------------------------------------------------
+cat("\n=== Saving detailed results ===\n")
+if (!is.null(test_gdm$gdm) && nrow(test_gdm$gdm) > 0) {
+  results_table <- test_gdm$gdm
+  # Add explanatory power level
+  results_table$explain_level <- cut(results_table$q,
+                                     breaks = c(0, 0.1, 0.3, 0.5, 1),
+                                     labels = c("weak", "moderate", "strong", "very strong"))
+  results_table <- results_table[order(-results_table$q), ]
+  
+  cat("\nGeodetector results (sorted by q‑value):\n")
+  print(results_table[, c("variable", "discmethod", "discitv", "q", "p", "explain_level")])
+  
+  # Save full table
+  write.csv(results_table, 
+            "D:/2025论文/计算地理探测器的表格/gd_detailed_results.csv", 
+            row.names = FALSE, fileEncoding = "UTF-8")
+  cat("Detailed results saved to: gd_detailed_results.csv\n")
+  
+  # Save simplified table
+  simple_results <- results_table[, c("variable", "q", "p", "explain_level")]
+  write.csv(simple_results, 
+            "D:/2025论文/计算地理探测器的表格/gd_simple_results.csv", 
+            row.names = FALSE, fileEncoding = "UTF-8")
+  cat("Simplified results saved to: gd_simple_results.csv\n")
+}
+
+# ---------------------------------------------------------------------
+# 7. Summary report
+# ---------------------------------------------------------------------
+cat("\n=== Summary of analysis ===\n")
+if (!is.null(test_gdm$gdm) && nrow(test_gdm$gdm) > 0) {
+  cat("1. Number of variables tested:", length(test_vars), "\n")
+  cat("2. Variables with valid q‑values:", nrow(test_gdm$gdm), "\n")
+  cat("3. q‑value range:", sprintf("%.3f - %.3f", 
+                                min(test_gdm$gdm$q), 
+                                max(test_gdm$gdm$q)), "\n")
+  cat("4. Mean q‑value:", sprintf("%.3f", mean(test_gdm$gdm$q)), "\n")
+  cat("5. Significant variables (p < 0.05):", sum(test_gdm$gdm$p < 0.05), "\n")
+  cat("6. Highly significant variables (p < 0.01):", sum(test_gdm$gdm$p < 0.01), "\n")
+  
+  # Top 3 factors
+  top3 <- test_gdm$gdm[order(-test_gdm$gdm$q), ][1:min(3, nrow(test_gdm$gdm)), ]
+  cat("\n7. Top 3 most important factors:\n")
+  for (i in 1:nrow(top3)) {
+    cat(sprintf("   %d. %s: q = %.3f, p = %.4f\n", 
+                i, top3$variable[i], top3$q[i], top3$p[i]))
+  }
+}
+
+# ---------------------------------------------------------------------
+# 8. Combined plot (optional)
+# ---------------------------------------------------------------------
+cat("\n=== Combined plot (optional) ===\n")
+par(mfrow = c(1, 2), mar = c(5, 4, 4, 2))
+
+if (!is.null(test_gdm$gdm) && nrow(test_gdm$gdm) > 0) {
+  results_sorted <- test_gdm$gdm[order(-test_gdm$gdm$q), ]
+  
+  # Left: q‑values
+  barplot(results_sorted$q, 
+          names.arg = substr(results_sorted$variable, 1, 10),
+          las = 2, col = "steelblue",
+          main = "q‑values (sorted)", ylab = "q‑value")
+  
+  # Right: -log10(p)
+  barplot(-log10(results_sorted$p + 1e-10), 
+          names.arg = substr(results_sorted$variable, 1, 10),
+          las = 2, col = ifelse(results_sorted$p < 0.05, "red", "gray"),
+          main = "Significance (-log10 p)", ylab = "-log10(p‑value)")
+  abline(h = -log10(0.05), col = "blue", lty = 2)
+  text(x = 1, y = -log10(0.05) + 0.2, "p = 0.05", col = "blue", cex = 0.8)
+}
+
+par(mfrow = c(1, 1))
+
+cat("\n=== Geodetector analysis completed ===\n")
