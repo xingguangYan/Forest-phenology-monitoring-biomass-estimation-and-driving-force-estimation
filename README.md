@@ -1,0 +1,2 @@
+# Forest-phenology-monitoring-biomass-estimation-and-driving-force-estimation
+ (1) Forest phenology monitoring: extract growing season metrics from time‑series data. (2) Biomass estimation: map above‑ground biomass using remote sensing features via machine learning models. (3) Driving force estimation: quantify contributions of climate, and human activities to phenology and biomass using geographical detectors.
